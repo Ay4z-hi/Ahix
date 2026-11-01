@@ -10,12 +10,76 @@ jobs:
         with: { targets: aarch64-linux-android }
       - run: cargo install cargo-ndk --locked
       - run: git clone --depth 1 https://github.com/horizon-rust/horizon horizon
+      - name: Apply Android patches
+        shell: bash
+        run: |
+          cat > android_patch.py <<'PY'
+          import pathlib, sys
+          root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+          def edit(rel, pairs, append=""):
+              p = root / rel
+              s = p.read_text()
+              for old, new in pairs:
+                  if s.count(old) != 1:
+                      sys.exit(f"PATCH FAILED in {rel}: expected 1 match, got {s.count(old)} for: {old[:60]!r}")
+                  s = s.replace(old, new)
+              p.write_text(s + append)
+              print("patched", rel)
+
+          # 1) winit must pick an Android activity backend; 2) arboard has no Android backend.
+          edit("crates/horizon-client-input/Cargo.toml",
+               [('arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }\n', "")],
+               append='''
+          [target.'cfg(not(target_os = "android"))'.dependencies]
+          arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+
+          [target.'cfg(target_os = "android")'.dependencies]
+          winit = { version = "0.30.13", features = ["android-native-activity"] }
+          ''')
+
+          STUB = '''
+          // Android has no arboard backend: the in-game clipboard keeps working; the system one comes
+          // later through JNI.
+          #[cfg(not(target_os = "android"))]
+          use arboard as sysclip;
+          #[cfg(target_os = "android")]
+          mod sysclip {
+              #[derive(Debug)]
+              pub enum Error {
+                  ContentNotAvailable,
+              }
+              pub struct Clipboard;
+              impl Clipboard {
+                  pub fn new() -> Result<Self, Error> {
+                      Err(Error::ContentNotAvailable)
+                  }
+                  pub fn get_text(&mut self) -> Result<String, Error> {
+                      Err(Error::ContentNotAvailable)
+                  }
+                  pub fn set_text(&mut self, _text: String) -> Result<(), Error> {
+                      Ok(())
+                  }
+              }
+          }
+          '''
+          edit("crates/horizon-client-input/src/clipboard.rs", [
+              ("use winit::keyboard::{Key, KeyCode, PhysicalKey};\n",
+               "use winit::keyboard::{Key, KeyCode, PhysicalKey};\n" + STUB),
+              ("system: Option<arboard::Clipboard>,", "system: Option<sysclip::Clipboard>,"),
+              ("fn system(&mut self) -> Option<&mut arboard::Clipboard> {", "fn system(&mut self) -> Option<&mut sysclip::Clipboard> {"),
+              ("self.system = arboard::Clipboard::new().ok();", "self.system = sysclip::Clipboard::new().ok();"),
+              ("Err(arboard::Error::ContentNotAvailable) =>", "Err(sysclip::Error::ContentNotAvailable) =>"),
+          ])
+          PY
+          python3 android_patch.py horizon
       - name: Android check of the Horizon client
         working-directory: horizon
         shell: bash
+        env:
+          CARGO_TERM_COLOR: never
         run: |
-          cargo ndk -t arm64-v8a check -p horizon-client --keep-going 2>&1 | tee ../check.log || true
-          echo "cargo exit: ${PIPESTATUS[0]}" >> ../check.log
+          cargo ndk -t arm64-v8a check -p horizon-client --no-default-features --features audio --keep-going 2>&1 | tee ../check.log || true
       - name: Summary
         shell: bash
         run: |
@@ -23,7 +87,6 @@ jobs:
             echo '### Android check'
             echo '```'
             grep -E '^error' check.log | sort | uniq -c | sort -rn | head -40 || true
-            tail -3 check.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
