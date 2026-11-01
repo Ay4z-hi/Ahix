@@ -1,0 +1,31 @@
+name: android-check
+on: workflow_dispatch
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: aarch64-linux-android }
+      - run: cargo install cargo-ndk --locked
+      - run: git clone --depth 1 https://github.com/horizon-rust/horizon horizon
+      - name: Android check of the Horizon client
+        working-directory: horizon
+        shell: bash
+        run: |
+          cargo ndk -t arm64-v8a check -p horizon-client --keep-going 2>&1 | tee ../check.log || true
+          echo "cargo exit: ${PIPESTATUS[0]}" >> ../check.log
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo '### Android check'
+            echo '```'
+            grep -E '^error' check.log | sort | uniq -c | sort -rn | head -40 || true
+            tail -3 check.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: check-log, path: check.log }
