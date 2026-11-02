@@ -1,0 +1,210 @@
+name: android-apk
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ahix }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: aarch64-linux-android }
+      - run: cargo install cargo-ndk --locked
+      - run: git clone --depth 1 https://github.com/horizon-rust/horizon ahix/horizon
+      - name: Apply Android patches to Horizon
+        shell: bash
+        run: |
+          cat > ahix/android_patch.py <<'PY'
+          import pathlib, sys
+          root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+          def edit(rel, pairs, append=""):
+              p = root / rel
+              s = p.read_text()
+              for old, new in pairs:
+                  if s.count(old) != 1:
+                      sys.exit(f"PATCH FAILED in {rel}: expected 1 match, got {s.count(old)} for: {old[:60]!r}")
+                  s = s.replace(old, new)
+              p.write_text(s + append)
+              print("patched", rel)
+
+          # 1) winit must pick an Android activity backend; 2) arboard has no Android backend.
+          edit("crates/horizon-client-input/Cargo.toml",
+               [('arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }\n', "")],
+               append='''
+          [target.'cfg(not(target_os = "android"))'.dependencies]
+          arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+
+          [target.'cfg(target_os = "android")'.dependencies]
+          winit = { version = "0.30.13", features = ["android-native-activity"] }
+          ''')
+
+          STUB = '''
+          // Android has no arboard backend: the in-game clipboard keeps working; the system one comes
+          // later through JNI.
+          #[cfg(not(target_os = "android"))]
+          use arboard as sysclip;
+          #[cfg(target_os = "android")]
+          mod sysclip {
+              #[derive(Debug)]
+              pub enum Error {
+                  ContentNotAvailable,
+              }
+              pub struct Clipboard;
+              impl Clipboard {
+                  pub fn new() -> Result<Self, Error> {
+                      Err(Error::ContentNotAvailable)
+                  }
+                  pub fn get_text(&mut self) -> Result<String, Error> {
+                      Err(Error::ContentNotAvailable)
+                  }
+                  pub fn set_text(&mut self, _text: String) -> Result<(), Error> {
+                      Ok(())
+                  }
+              }
+          }
+          '''
+          edit("crates/horizon-client-input/src/clipboard.rs", [
+              ("use winit::keyboard::{Key, KeyCode, PhysicalKey};\n",
+               "use winit::keyboard::{Key, KeyCode, PhysicalKey};\n" + STUB),
+              ("system: Option<arboard::Clipboard>,", "system: Option<sysclip::Clipboard>,"),
+              ("fn system(&mut self) -> Option<&mut arboard::Clipboard> {", "fn system(&mut self) -> Option<&mut sysclip::Clipboard> {"),
+              ("self.system = arboard::Clipboard::new().ok();", "self.system = sysclip::Clipboard::new().ok();"),
+              ("Err(arboard::Error::ContentNotAvailable) => String::new(),\n            Err(_) => {", "Err(_) => {"),
+          ])
+
+          # 3) `key_without_modifiers` only exists on desktop winit builds. On Android, fall back to the
+          # event's plain (modified) key — layout auto-detection is a desktop nicety, not needed for touch.
+          edit("crates/horizon-client-input/src/keybinds.rs", [
+              ('''pub fn learn_layout(event: &winit::event::KeyEvent) {
+              use winit::keyboard::{Key, PhysicalKey};
+              use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+              let PhysicalKey::Code(code) = event.physical_key else {
+                  return;
+              };
+              let Some(name) = key_name(code) else {
+                  return;
+              };
+              let learn = horizon_client_core::key_display::learn_layout;
+              match event.key_without_modifiers() {
+                  Key::Character(text) => learn(name, &text),
+                  Key::Dead(Some(c)) => learn(name, c.encode_utf8(&mut [0; 4])),
+                  _ => {}
+              }
+          }''',
+               '''pub fn learn_layout(event: &winit::event::KeyEvent) {
+              use winit::keyboard::{Key, PhysicalKey};
+              let PhysicalKey::Code(code) = event.physical_key else {
+                  return;
+              };
+              let Some(name) = key_name(code) else {
+                  return;
+              };
+              let learn = horizon_client_core::key_display::learn_layout;
+              #[cfg(not(target_os = "android"))]
+              let key = {
+                  use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+                  event.key_without_modifiers()
+              };
+              // Android/touch input has no hardware layout to learn from.
+              #[cfg(target_os = "android")]
+              let key = event.logical_key.clone();
+              match key {
+                  Key::Character(text) => learn(name, &text),
+                  Key::Dead(Some(c)) => learn(name, c.encode_utf8(&mut [0; 4])),
+                  _ => {}
+              }
+          }'''),
+          ])
+
+          # 4) Add a library entry point Android (or any embedder) can call: `game::run()` only exists
+          # for the `horizon-client` binary today (parses argv, always calls EventLoop::new()). This adds
+          # `horizon_client::run_embedded(event_loop, resources, game_dir)`, which builds `Options` itself
+          # (no CLI parsing) and reuses the exact same startup path, with the event loop supplied by the
+          # caller so it can be Android's (or any host's) rather than a new OS window.
+          edit("crates/horizon-client/src/lib.rs", [
+              ("pub mod game_mode_switcher;",
+               "pub mod game;\npub mod game_mode_switcher;"),
+          ])
+
+          edit("crates/horizon-client/src/game.rs", [
+              ("fn run_loading(\n    options: Options,",
+               "pub fn run_loading(\n    options: Options,"),
+              ("    let mut app = App::Loading(Box::new(loading));\n    let result = EventLoop::new()?.run_app(&mut app);",
+               "    let mut app = App::Loading(Box::new(loading));\n    let result = EVENT_LOOP\n        .with(|cell| cell.take())\n        .map_or_else(|| EventLoop::new(), Ok)?\n        .run_app(&mut app);"),
+              ("#[derive(Clone)]\nstruct Options {",
+               "#[derive(Clone)]\npub struct Options {"),
+              ("fn player_name(&self) -> String {",
+               "pub fn player_name(&self) -> String {"),
+              ("impl Options {\n    /// The name to join servers",
+               "impl Options {\n    /// Minimal options for an embedding host (Android) that has no command line: single\n    /// player, resources already prepared at `resources`, saves and settings under `game_dir`.\n    pub fn embedded(resources: PathBuf, game_dir: PathBuf) -> Result<Self> {\n        std::fs::create_dir_all(&game_dir)?;\n        std::env::set_current_dir(&game_dir)?;\n        Ok(Self {\n            resources,\n            distance: 8,\n            distance_override: None,\n            seed: 0,\n            creative: false,\n            test_terrain: false,\n            frames: None,\n            paced_by_split: false,\n            split_guest: false,\n            split_in_main_window: false,\n            world_frames: None,\n            screenshot_after: None,\n            timeout: Duration::from_secs(120),\n            report: None,\n            world: None,\n            look: None,\n            time: None,\n            weather: None,\n            dimension: None,\n            no_pause: false,\n            control: None,\n            spikes: None,\n            offscreen: false,\n            headless: false,\n            window_size: [1280, 720],\n            server: None,\n            player_name: None,\n            dedicated: None,\n            benchmark: None,\n            dev_mods: Vec::new(),\n            server_thread: true,\n            execution_role: execution_role::ExecutionRole::Client,\n            fullscreen: true,\n            game_dir: None,\n            quick_play: None,\n            session_file: None,\n            session_stdin: false,\n        })\n    }\n    /// The name to join servers"),
+              ("pub use launch_api::{UsageError, exit_code};\n\npub fn run() -> Result<()> {",
+               '''pub use launch_api::{UsageError, exit_code};
+
+          thread_local! {
+              /// `run_with_event_loop` stashes the caller's event loop here so `run_loading`'s single
+              /// `EventLoop::new()` call site can take it instead, without changing that function's
+              /// signature for the (much more common) desktop binary path.
+              static EVENT_LOOP: std::cell::Cell<Option<EventLoop<()>>> = const { std::cell::Cell::new(None) };
+          }
+
+          /// Entry point for an embedding host (Android's `android_main`, or any other caller that
+          /// already has a winit `EventLoop` and a place to put save data) instead of the
+          /// `horizon-client` binary. Skips command-line parsing, the launcher heartbeat/Discord
+          /// presence/official-server-list side effects (an embedder does those itself if it wants
+          /// them), and goes straight to single-player's ordinary loading screen.
+          pub fn run_embedded(
+              event_loop: EventLoop<()>,
+              resources: PathBuf,
+              game_dir: PathBuf,
+          ) -> Result<()> {
+              if let Some(error) = missing_resources(&resources) {
+                  return Err(error.into());
+              }
+              let options = Options::embedded(resources.clone(), game_dir)?;
+              mods::register_components(&resources)?;
+              let early_settings = Settings::load(&Game::options_path());
+              narrator::start(&early_settings);
+              Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
+              EVENT_LOOP.with(|cell| cell.set(Some(event_loop)));
+              run_loading(options, early_settings, resources, None, Instant::now())
+          }
+
+          pub fn run() -> Result<()> {'''),
+          ])
+          PY
+          python3 ahix/android_patch.py ahix/horizon
+      - name: Build ahix-core (cdylib) for arm64-v8a
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo ndk -t arm64-v8a -o ahix/android/app/src/main/jniLibs \
+            build --release --manifest-path ahix/crates/ahix-core/Cargo.toml \
+            2>&1 | tee build.log || true
+          echo "--- last 60 lines ---"
+          tail -60 build.log
+          ls -la ahix/android/app/src/main/jniLibs/arm64-v8a/ || true
+          grep -q '^error' build.log && exit 1 || true
+      - name: Assemble debug APK
+        if: success()
+        working-directory: ahix/android
+        run: chmod +x gradlew 2>/dev/null; gradle wrapper --gradle-version 8.10.2 --quiet || true; ./gradlew assembleDebug --no-daemon
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '### Ahix Android build'
+            echo '```'
+            grep -E '^error' build.log | sort | uniq -c | sort -rn | head -40 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: build-log, path: build.log }
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with: { name: ahix-debug-apk, path: ahix/android/app/build/outputs/apk/debug/*.apk }
