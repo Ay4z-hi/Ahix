@@ -140,8 +140,10 @@ jobs:
                "pub fn player_name(&self) -> String {"),
               ("impl Options {\n    /// The name to join servers",
                "impl Options {\n    /// Minimal options for an embedding host (Android) that has no command line: single\n    /// player, resources already prepared at `resources`, saves and settings under `game_dir`.\n    pub fn embedded(resources: PathBuf, game_dir: PathBuf) -> Result<Self> {\n        std::fs::create_dir_all(&game_dir)?;\n        std::env::set_current_dir(&game_dir)?;\n        Ok(Self {\n            resources,\n            distance: 8,\n            distance_override: None,\n            seed: 0,\n            creative: false,\n            test_terrain: false,\n            frames: None,\n            paced_by_split: false,\n            split_guest: false,\n            split_in_main_window: false,\n            world_frames: None,\n            screenshot_after: None,\n            timeout: Duration::from_secs(120),\n            report: None,\n            world: None,\n            look: None,\n            time: None,\n            weather: None,\n            dimension: None,\n            no_pause: false,\n            control: None,\n            spikes: None,\n            offscreen: false,\n            headless: false,\n            window_size: [1280, 720],\n            server: None,\n            player_name: None,\n            dedicated: None,\n            benchmark: None,\n            dev_mods: Vec::new(),\n            server_thread: true,\n            execution_role: execution_role::ExecutionRole::Client,\n            fullscreen: true,\n            game_dir: None,\n            quick_play: None,\n            session_file: None,\n            session_stdin: false,\n        })\n    }\n    /// The name to join servers"),
-              ("pub fn run() -> Result<()> {",
-               '''thread_local! {
+              ("    narrator::stop();\n    match &mut app {\n        // Ready: splitscreen around P1's game.\n        App::Ready(split) => leave_fullscreen_after(&result, &mut split.host.settings),\n        App::Loading(loading) => leave_fullscreen_after(&result, &mut loading.settings),\n    }\n    result?;\n    horizon_client::discord_presence::stop();\n    match app {\n        App::Ready(mut split) => {\n            write_report(&split.host)?;\n            if let Some(e) = split.host.error.take() {\n                return Err(e);\n            }\n        }\n        App::Loading(loading) => {\n            if let Some(e) = loading.error {\n                return Err(e);\n            }\n        }\n    }\n    Ok(())\n}",
+               "    narrator::stop();\n    match &mut app {\n        // Ready: splitscreen around P1's game.\n        App::Ready(split) => leave_fullscreen_after(&result, &mut split.host.settings),\n        App::Loading(loading) => leave_fullscreen_after(&result, &mut loading.settings),\n    }\n    result?;\n    horizon_client::discord_presence::stop();\n    match app {\n        App::Ready(mut split) => {\n            write_report(&split.host)?;\n            if let Some(e) = split.host.error.take() {\n                return Err(e);\n            }\n        }\n        App::Loading(loading) => {\n            if let Some(e) = loading.error {\n                return Err(e);\n            }\n        }\n    }\n    Ok(())\n}" + '''
+
+          thread_local! {
               /// `run_embedded` stashes the caller's event loop here so `run_loading`'s single
               /// `EventLoop::new()` call site can take it instead, without changing that function's
               /// signature for the (much more common) desktop binary path.
@@ -168,9 +170,7 @@ jobs:
               Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
               EVENT_LOOP.with(|cell| cell.set(Some(event_loop)));
               run_loading(options, early_settings, resources, None, Instant::now())
-          }
-
-          pub fn run() -> Result<()> {'''),
+          }'''),
           ])
           PY
           python3 ahix/android_patch.py ahix/horizon 2>&1 | tee build.log
